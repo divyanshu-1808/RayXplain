@@ -1,0 +1,30 @@
+# ==============================================================================
+# RayXplain - Multi-Modal Lung Disease Diagnostic Assistant
+# Phase 1: Production Dependencies Specification
+# Target Python Version: 3.11.x (Tested on Python 3.11.9, Windows x64)
+# ==============================================================================
+
+# --- PyTorch Deep Learning Stack (CUDA 12.1 / CPU Compatible) ---
+# NOTE: For GPU acceleration on Windows (e.g. RTX 40-series), install with index URL:
+#   pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+# For CPU-only environments:
+#   pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cpu
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
+
+# --- Numerical & Data Processing Core ---
+# NOTE: numpy 1.26.4 ensures rock-solid C-ABI compatibility across PyTorch, OpenCV, and Scikit-Learn
+numpy==1.26.4
+pandas==2.2.2
+
+# --- Classical Machine Learning & Pipeline Serialization ---
+scikit-learn==1.5.2
+joblib==1.4.2
+
+# --- Computer Vision & Medical Image Preprocessing ---
+opencv-python==4.10.0.84
+pillow==10.4.0
+
+# --- Web UI & Explainability Dashboard ---
+gradio==4.44.1

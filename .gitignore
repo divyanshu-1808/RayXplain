@@ -1,0 +1,86 @@
+# ==============================================================================
+# RayXplain - Git Ignore Configuration
+# ==============================================================================
+
+# --- Python Virtual Environments ---
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Python Bytecode & Compilation Caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- Temporary Uploads & Web UI Caches ---
+uploads/
+temp/
+tmp/
+*.tmp
+flagged/
+.gradio/
+gradio_cached_examples/
+
+# --- Model Checkpoints, Training Artifacts & Logs ---
+checkpoints/
+*.ckpt
+*.pt
+runs/
+logs/
+*.log
+wandb/
+
+# Note: Keep the core model weights & clinical scaler tracked in Git / Git-LFS
+!weights/best_multimodal_model.pth
+!data/scaler.joblib
+
+# Ignore intermediate/experimental model exports
+weights/*.tmp
+weights/checkpoint_*.pth
+weights/experiment_*.pth
+
+# --- Testing & Quality Tools ---
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# --- Jupyter Notebooks ---
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# --- IDEs & OS Specific ---
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+
+# --- Project Documentation & Academic Reports ---
+docs/
+
