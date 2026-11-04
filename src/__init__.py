@@ -10,6 +10,7 @@ from .model import (
     MultimodalLungNet,
     build_model,
 )
+from .gradcam import GradCAM, overlay_heatmap
 
 __all__ = [
     "MultiModalLungNet",
@@ -17,4 +18,6 @@ __all__ = [
     "build_model",
     "CLASS_NAMES",
     "CLINICAL_FEATURE_NAMES",
+    "GradCAM",
+    "overlay_heatmap",
 ]
