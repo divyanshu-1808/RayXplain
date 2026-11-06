@@ -11,6 +11,7 @@ from .model import (
     build_model,
 )
 from .gradcam import GradCAM, overlay_heatmap
+from .pipeline import DiagnosticPipeline, TARGET_CLASSES
 
 __all__ = [
     "MultiModalLungNet",
@@ -20,4 +21,6 @@ __all__ = [
     "CLINICAL_FEATURE_NAMES",
     "GradCAM",
     "overlay_heatmap",
+    "DiagnosticPipeline",
+    "TARGET_CLASSES",
 ]
