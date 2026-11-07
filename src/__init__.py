@@ -12,6 +12,7 @@ from .model import (
 )
 from .gradcam import GradCAM, overlay_heatmap
 from .pipeline import DiagnosticPipeline, TARGET_CLASSES
+from .record_keeper import CaseArchiver
 
 __all__ = [
     "MultiModalLungNet",
@@ -23,4 +24,5 @@ __all__ = [
     "overlay_heatmap",
     "DiagnosticPipeline",
     "TARGET_CLASSES",
+    "CaseArchiver",
 ]

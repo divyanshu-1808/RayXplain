@@ -81,25 +81,34 @@ class TestDiagnosticPipeline(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.pipeline.validate_inputs(None, 40, "Male", 95, 0, 0, 98.6)
 
-        # Negative age
+        # Negative or zero age (< 1)
         with self.assertRaises(ValueError):
             self.pipeline.validate_inputs(dummy_img, -1, "Male", 95, 0, 0, 98.6)
-
-        # Extreme age > 125
         with self.assertRaises(ValueError):
-            self.pipeline.validate_inputs(dummy_img, 150, "Male", 95, 0, 0, 98.6)
+            self.pipeline.validate_inputs(dummy_img, 0, "Male", 95, 0, 0, 98.6)
 
-        # Invalid SpO2 (< 40%)
+        # Extreme age > 110
         with self.assertRaises(ValueError):
-            self.pipeline.validate_inputs(dummy_img, 50, "Male", 30.0, 0, 0, 98.6)
+            self.pipeline.validate_inputs(dummy_img, 115, "Male", 95, 0, 0, 98.6)
+
+        # Non-numeric SpO2
+        with self.assertRaises(ValueError):
+            self.pipeline.validate_inputs(dummy_img, 50, "Male", "invalid_spo2", 0, 0, 98.6)
+
+        # SpO2 clamping between [50, 100]
+        _, vitals, warns = self.pipeline.validate_inputs(dummy_img, 50, "Male", 30.0, 0, 0, 98.6)
+        self.assertEqual(vitals["spo2"], 50.0)
+        self.assertTrue(any("clamped" in w.lower() for w in warns))
 
         # Negative smoking pack-years
         with self.assertRaises(ValueError):
             self.pipeline.validate_inputs(dummy_img, 50, "Male", 95.0, -5.0, 0, 98.6)
 
-        # Extreme body temperature
+        # Body temperature outside [95.0, 107.0]°F
         with self.assertRaises(ValueError):
-            self.pipeline.validate_inputs(dummy_img, 50, "Male", 95.0, 0, 0, 150.0)
+            self.pipeline.validate_inputs(dummy_img, 50, "Male", 95.0, 0, 0, 94.0)
+        with self.assertRaises(ValueError):
+            self.pipeline.validate_inputs(dummy_img, 50, "Male", 95.0, 0, 0, 108.0)
 
     def test_predict_end_to_end(self):
         """Verify full predict() pipeline returns (overlay, probabilities_dict, predicted_class_name)."""

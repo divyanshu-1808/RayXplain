@@ -488,7 +488,7 @@ class GradCAM:
             src2=orig_rgb,
             beta=1.0 - alpha_clamped,
             gamma=0.0,
-        )
+        ).astype(np.uint8)
 
         return blended
 

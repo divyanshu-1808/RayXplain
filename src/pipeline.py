@@ -1,15 +1,21 @@
 """
 RayXplain - Multi-Modal Lung Disease Diagnostic Assistant
-Phase 4: End-to-End Diagnostic Pipeline (Model + Preprocessing + Grad-CAM)
+Phase 4 & Phase 6: Hardened End-to-End Diagnostic Pipeline
 
-This module provides the complete inference pipeline for RayXplain:
+This module provides the complete, production-grade inference pipeline for RayXplain:
 1. Loads the trained MultiModalLungNet model weights (auto-detecting CUDA/CPU device).
-2. Loads and applies the fitted clinical StandardScaler.
-3. Implements standard radiograph preprocessing (Resize, ToTensor, ImageNet normalization).
-4. Integrates GradCAM visual explainability to produce saliency heatmaps overlaid on radiographs.
-5. Provides a unified, validated `predict()` method returning class probabilities, predictions, and overlays.
+2. Auto-recovers from CUDA Out-of-Memory (OOM) by automatically falling back to CPU.
+3. Deserializes and applies the fitted clinical StandardScaler.
+4. Robust Image Ingestion: handles 1-channel Grayscale, 4-channel RGBA, 3-channel RGB,
+   and catches corrupted/empty files gracefully.
+5. Strict Tabular Sanity Checks: SpO2 clamped to [50, 100], Age validated in [1, 110],
+   Body Temperature validated in [95.0, 107.0]°F.
+6. Proactive Clinical Alerting: flags atypical vitals (critical hypoxemia, high pyrexia, etc.).
+7. Integrates GradCAM visual explainability to produce saliency heatmaps overlaid on radiographs.
 """
 
+import io
+import logging
 import os
 import sys
 import warnings
@@ -27,8 +33,16 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from torchvision import transforms
+
+# Setup module logger
+logger = logging.getLogger("RayXplain.Pipeline")
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 # Suppress harmless sklearn unpickling warnings if minor version discrepancies exist
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
@@ -53,12 +67,271 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
+def sanitize_image(pil_image: Any) -> Image.Image:
+    """
+    Validate, sanitize, and convert any valid 2D/3D image into a standardized 3-channel RGB PIL Image.
+
+    Robustly handles:
+    - 1-channel Grayscale images (PIL 'L', '1', 'I', 'F', and numpy 2D arrays).
+    - 4-channel RGBA images (compositing with a neutral white background to eliminate transparency artifacts).
+    - Palette ('P') and CMYK images.
+    - Raw numpy arrays (2D grayscale, 3D 1-channel, 3D 3-channel, 3D 4-channel).
+    - File paths with corrupted byte streams or unsupported file formats.
+
+    Args:
+        pil_image: Image representation (PIL Image, numpy array, or file path).
+
+    Returns:
+        Image.Image: Standardized 3-channel RGB PIL Image.
+
+    Raises:
+        ValueError: If image is None, empty, corrupted, or unsupported.
+    """
+    if pil_image is None:
+        raise ValueError("Chest radiograph input is required and cannot be None.")
+
+    # 1. Handle file paths (str or Path)
+    if isinstance(pil_image, (str, Path)):
+        img_path = Path(pil_image)
+        if not img_path.is_file():
+            raise ValueError(f"Image file not found at path: {img_path}")
+        try:
+            with Image.open(str(img_path)) as loaded:
+                loaded.load()  # Force decode to catch truncated or corrupted files
+                pil_image = loaded.copy()
+        except (UnidentifiedImageError, OSError, ValueError) as err:
+            raise ValueError(f"Corrupted or unsupported image file '{img_path.name}': {err}")
+
+    # 2. Handle raw bytes / bytearrays
+    elif isinstance(pil_image, (bytes, bytearray)):
+        if len(pil_image) == 0:
+            raise ValueError("Empty image byte buffer provided.")
+        try:
+            with Image.open(io.BytesIO(pil_image)) as loaded:
+                loaded.load()
+                pil_image = loaded.copy()
+        except Exception as err:
+            raise ValueError(f"Failed to decode image from byte buffer: {err}")
+
+    # 3. Handle NumPy Arrays
+    if isinstance(pil_image, np.ndarray):
+        arr = pil_image
+        if arr.size == 0:
+            raise ValueError("Empty image array provided (size is 0).")
+
+        if arr.ndim == 2:
+            # 2D Grayscale: (H, W)
+            if arr.dtype != np.uint8:
+                arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8) if arr.max() <= 1.0 else np.clip(arr, 0, 255).astype(np.uint8)
+            img = Image.fromarray(arr, mode="L").convert("RGB")
+        elif arr.ndim == 3:
+            channels = arr.shape[2]
+            if arr.dtype != np.uint8:
+                arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8) if arr.max() <= 1.0 else np.clip(arr, 0, 255).astype(np.uint8)
+
+            if channels == 1:
+                # 3D 1-channel Grayscale: (H, W, 1)
+                img = Image.fromarray(arr[:, :, 0], mode="L").convert("RGB")
+            elif channels == 3:
+                # 3D 3-channel RGB: (H, W, 3)
+                img = Image.fromarray(arr, mode="RGB")
+            elif channels == 4:
+                # 3D 4-channel RGBA: (H, W, 4) -> composite with white background
+                rgba = Image.fromarray(arr, mode="RGBA")
+                bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                bg.paste(rgba, mask=rgba.split()[-1])
+                img = bg
+            else:
+                raise ValueError(f"Unsupported image channel count: {channels}. Expected 1, 3, or 4 channels.")
+        else:
+            raise ValueError(f"Invalid image array dimensions: expected 2D or 3D array, got {arr.ndim}D with shape {arr.shape}.")
+        pil_image = img
+
+    # 4. Handle PIL Image Instances
+    if isinstance(pil_image, Image.Image):
+        w, h = pil_image.size
+        if w <= 0 or h <= 0:
+            raise ValueError(f"Invalid image dimensions: width={w}, height={h}.")
+
+        # Handle transparency (RGBA, LA, or palette with transparency)
+        if pil_image.mode in ("RGBA", "LA") or ("transparency" in pil_image.info) or ("A" in pil_image.getbands()):
+            rgba = pil_image.convert("RGBA")
+            bg = Image.new("RGB", rgba.size, (255, 255, 255))
+            bg.paste(rgba, mask=rgba.split()[-1])
+            return bg
+
+        # 1-channel Grayscale ('L', '1', 'I', 'F') or Palette ('P') or CMYK -> standard 3-channel RGB
+        return pil_image.convert("RGB")
+
+    raise ValueError(f"Unsupported image object type: {type(pil_image)}. Expected PIL Image, NumPy array, or file path.")
+
+
+def check_clinical_vitals(
+    age: Any,
+    sex: Any,
+    spo2: Any,
+    smoking: Any,
+    cough_severity: Any,
+    fever: Any,
+) -> Tuple[Dict[str, float], List[str]]:
+    """
+    Validate and clamp tabular clinical inputs, producing sanitized numeric values and clinical warnings.
+
+    Enforces Phase 6 requirements:
+    - SpO2 is clamped between [50.0, 100.0]%.
+    - Age is strictly validated within [1, 110] years.
+    - Temperature is strictly validated within [95.0, 107.0]°F (auto-converting Celsius if needed).
+    - Identifies atypical clinical vitals and returns formatted user-facing alert messages.
+
+    Returns:
+        Tuple[Dict[str, float], List[str]]: Sanitized feature dictionary and list of warning messages.
+
+    Raises:
+        ValueError: If values are null, empty, non-numeric, or outside valid physiological bounds.
+    """
+    warnings_list: List[str] = []
+
+    # 1. Null / Empty Checks
+    raw_dict = {
+        "age": age,
+        "sex": sex,
+        "spo2": spo2,
+        "smoking": smoking,
+        "cough_severity": cough_severity,
+        "fever": fever,
+    }
+    for key, val in raw_dict.items():
+        if val is None or (isinstance(val, str) and not val.strip()):
+            raise ValueError(f"Clinical parameter '{key}' cannot be null or empty.")
+
+    # 2. Age Validation: [1, 110]
+    try:
+        age_f = float(age)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid age value '{age}'. Must be a valid number.")
+
+    if not (1.0 <= age_f <= 110.0):
+        raise ValueError(f"Patient age must be between 1 and 110 years (got {age_f}).")
+
+    if age_f > 75.0:
+        warnings_list.append("ℹ️ Geriatric Profile: Patient age > 75 increases susceptibility to severe pulmonary complications.")
+
+    # 3. Biological Sex Parsing
+    if isinstance(sex, str):
+        sex_clean = sex.strip().lower()
+        if sex_clean in ("male", "m", "1", "1.0", "true"):
+            sex_val = 1.0
+        elif sex_clean in ("female", "f", "0", "0.0", "false"):
+            sex_val = 0.0
+        else:
+            raise ValueError(f"Unrecognized biological sex '{sex}'. Supported: 'Male', 'Female', 1, 0.")
+    else:
+        sex_val = 1.0 if float(sex) > 0.5 else 0.0
+
+    # 4. SpO2 Validation & Clamping: [50.0, 100.0]
+    try:
+        raw_spo2 = float(spo2)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid SpO2 value '{spo2}'. Must be a valid numeric percentage.")
+
+    # Auto-scale decimals (e.g. 0.94 -> 94.0%)
+    if 0.0 < raw_spo2 <= 1.0:
+        raw_spo2 *= 100.0
+
+    # Clamping between [50.0, 100.0]
+    spo2_clamped = float(np.clip(raw_spo2, 50.0, 100.0))
+
+    if raw_spo2 < 50.0:
+        warnings_list.append(f"⚠️ Atypical SpO2 ({raw_spo2:.1f}%): Value was clamped to physiological floor (50.0%).")
+    elif raw_spo2 > 100.0:
+        warnings_list.append(f"⚠️ Atypical SpO2 ({raw_spo2:.1f}%): Value was clamped to maximum saturation (100.0%).")
+
+    if spo2_clamped < 90.0:
+        warnings_list.append("🚨 Critical Hypoxemia Alert: SpO2 is critically low (<90%). Immediate oxygenation therapy indicated.")
+
+    # 5. Smoking Pack-Years
+    if isinstance(smoking, str):
+        smk_clean = smoking.strip().lower()
+        if smk_clean in ("no", "never", "none", "0"):
+            smoking_val = 0.0
+        else:
+            try:
+                smoking_val = float(smk_clean)
+            except ValueError:
+                raise ValueError(f"Invalid smoking exposure '{smoking}'. Expected nonnegative number or 'None'.")
+    else:
+        smoking_val = float(smoking)
+
+    if smoking_val < 0.0:
+        raise ValueError(f"Smoking pack-years cannot be negative (got {smoking_val}).")
+
+    if smoking_val > 30.0:
+        warnings_list.append("ℹ️ Heavy Smoking Exposure: >30 pack-years indicates elevated chronic lung pathology risk.")
+
+    # 6. Cough Severity
+    if isinstance(cough_severity, str):
+        cough_clean = cough_severity.strip().lower()
+        cough_map = {
+            "none": 0.0,
+            "no": 0.0,
+            "normal": 0.0,
+            "mild": 1.0,
+            "moderate": 2.0,
+            "severe": 3.0,
+            "high": 3.0,
+        }
+        if cough_clean in cough_map:
+            cough_val = cough_map[cough_clean]
+        else:
+            try:
+                cough_val = float(cough_clean)
+            except ValueError:
+                raise ValueError(f"Unrecognized cough severity '{cough_severity}'. Supported: 'None', 'Mild', 'Moderate', 'Severe' or 0-3.")
+    else:
+        cough_val = float(cough_severity)
+
+    # 7. Body Temperature: [95.0, 107.0]°F
+    try:
+        raw_temp = float(fever)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid temperature value '{fever}'. Must be a valid number.")
+
+    # Celsius conversion (25.0 - 45.0°C)
+    if 25.0 <= raw_temp <= 45.0:
+        temp_f = raw_temp * 1.8 + 32.0
+    elif raw_temp in (0.0, 1.0):
+        temp_f = 101.5 if raw_temp == 1.0 else 98.6
+    else:
+        temp_f = raw_temp
+
+    # Strict boundary check [95.0, 107.0]°F
+    if not (95.0 <= temp_f <= 107.0):
+        raise ValueError(f"Body temperature {temp_f:.1f}°F is outside the valid physiological range of [95.0, 107.0]°F.")
+
+    if temp_f >= 101.0:
+        warnings_list.append(f"⚠️ Pyrexia Alert: Elevated core body temperature detected ({temp_f:.1f}°F >= 101.0°F).")
+    elif temp_f <= 96.0:
+        warnings_list.append(f"⚠️ Hypothermia Alert: Core body temperature is abnormally subnormal ({temp_f:.1f}°F <= 96.0°F).")
+
+    sanitized = {
+        "age": age_f,
+        "sex": sex_val,
+        "spo2": spo2_clamped,
+        "smoking_history": smoking_val,
+        "cough_severity": cough_val,
+        "fever": temp_f,
+    }
+
+    return sanitized, warnings_list
+
+
 class DiagnosticPipeline:
     """
-    Unified multimodal diagnostic assessment pipeline for pulmonary disease prediction.
+    Hardened multimodal diagnostic assessment pipeline for pulmonary disease prediction.
 
     Coordinates chest X-ray image transforms, clinical tabular parameter scaling,
     multimodal model inference, and Grad-CAM saliency explanation generation.
+    Equipped with automatic CUDA OOM fallback to CPU.
 
     Attributes:
         device (torch.device): Compute device ('cuda' if available, otherwise 'cpu').
@@ -66,6 +339,7 @@ class DiagnosticPipeline:
         scaler (Any): The fitted scikit-learn StandardScaler for tabular features.
         gradcam (GradCAM): Hooked Grad-CAM explainability engine.
         image_transform (transforms.Compose): Image preprocessing pipeline.
+        last_warnings (List[str]): Cached clinical warning messages from most recent prediction.
     """
 
     def __init__(
@@ -99,7 +373,7 @@ class DiagnosticPipeline:
         if not self.model_path.is_file():
             raise FileNotFoundError(f"Model checkpoint not found at: {self.model_path.resolve()}")
 
-        print(f"[DiagnosticPipeline] Loading model on device: {self.device} from {self.model_path.name}")
+        logger.info(f"Loading model on device: {self.device} from {self.model_path.name}")
         self.model = build_model(
             pretrained=False,
             weights_path=self.model_path,
@@ -111,7 +385,7 @@ class DiagnosticPipeline:
         if not self.scaler_path.is_file():
             raise FileNotFoundError(f"Clinical scaler artifact not found at: {self.scaler_path.resolve()}")
 
-        print(f"[DiagnosticPipeline] Loading scaler from: {self.scaler_path.name}")
+        logger.info(f"Loading scaler from: {self.scaler_path.name}")
         self.scaler = joblib.load(str(self.scaler_path))
 
         # Expected feature names from scaler or fallback standard
@@ -131,40 +405,43 @@ class DiagnosticPipeline:
 
         # 6. Attach GradCAM instance to target convolutional stage (layer4)
         self.gradcam = GradCAM(model=self.model, target_layer_name="layer4")
-        print(f"[DiagnosticPipeline] Attached GradCAM to {self.gradcam.target_layer_name}")
+        logger.info(f"Attached GradCAM to {self.gradcam.target_layer_name}")
 
-    def transform_image(self, pil_image: Union[Image.Image, np.ndarray, str, Path]) -> torch.Tensor:
+        self.last_warnings: List[str] = []
+
+    def fallback_to_cpu(self) -> None:
         """
-        Preprocess a chest radiograph for model ingestion.
+        Gracefully migrate model, GradCAM, and execution state from CUDA to CPU upon Out-of-Memory (OOM).
+        """
+        logger.warning("[DiagnosticPipeline] CUDA Out-of-Memory detected! Initiating emergency CPU migration...")
+        warnings.warn("[DiagnosticPipeline] CUDA Out of Memory! Automatically falling back to CPU.", RuntimeWarning)
 
-        Process:
-        1. Convert image to PIL RGB format.
-        2. Resize to (224, 224).
-        3. Convert pixel values to [0.0, 1.0] tensor.
-        4. Apply ImageNet channel standardization.
-        5. Add batch dimension and transfer to device.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self.device = torch.device("cpu")
+        self.model.to(self.device)
+        self.model.eval()
+
+        # Re-initialize GradCAM on CPU
+        if hasattr(self, "gradcam") and self.gradcam is not None:
+            self.gradcam.remove_hooks()
+            self.gradcam = GradCAM(model=self.model, target_layer_name="layer4")
+
+        logger.info("[DiagnosticPipeline] Emergency migration complete: pipeline operational on CPU.")
+
+    def transform_image(self, pil_image: Any) -> torch.Tensor:
+        """
+        Preprocess any valid radiograph input into a normalized model tensor.
 
         Args:
-            pil_image: PIL Image, RGB numpy array, or file path.
+            pil_image: PIL Image, RGB/RGBA/Grayscale numpy array, or file path.
 
         Returns:
             torch.Tensor: Normalized tensor of shape [1, 3, 224, 224] on self.device.
         """
-        if isinstance(pil_image, (str, Path)):
-            img = Image.open(str(pil_image)).convert("RGB")
-        elif isinstance(pil_image, np.ndarray):
-            if pil_image.ndim == 2:
-                img = Image.fromarray(pil_image).convert("RGB")
-            elif pil_image.ndim == 3 and pil_image.shape[2] == 1:
-                img = Image.fromarray(pil_image.squeeze(2)).convert("RGB")
-            else:
-                img = Image.fromarray(pil_image[:, :, :3]).convert("RGB")
-        elif isinstance(pil_image, Image.Image):
-            img = pil_image.convert("RGB")
-        else:
-            raise ValueError(f"Unsupported image type: {type(pil_image)}")
-
-        tensor = self.image_transform(img)  # Shape: [3, 224, 224]
+        clean_pil = sanitize_image(pil_image)
+        tensor = self.image_transform(clean_pil)  # Shape: [3, 224, 224]
         tensor = tensor.unsqueeze(0).to(self.device)  # Shape: [1, 3, 224, 224]
         return tensor
 
@@ -180,91 +457,21 @@ class DiagnosticPipeline:
         """
         Preprocess and standardize clinical tabular input parameters.
 
-        Process:
-        1. Parse and standardize categorical and numeric values.
-        2. Construct structured 2D DataFrame matching scaler feature schema.
-        3. Transform values via loaded StandardScaler.
-        4. Convert output to float32 tensor on self.device.
-
-        Args:
-            age: Patient age in years (0 - 120).
-            sex: Sex category ("Male", "Female", 1, 0, etc.).
-            spo2: Blood oxygen saturation percentage (0 - 100).
-            smoking_history: Cumulative smoking pack-years (nonnegative float).
-            cough_severity: Cough severity scale (0 - 3 or "None", "Mild", "Moderate", "Severe").
-            fever: Body temperature (in °F, or °C converted to °F, or binary).
-
         Returns:
             torch.Tensor: Standardized tabular tensor of shape [1, 6] on self.device.
         """
-        # Encode sex: Female=0.0, Male=1.0
-        if isinstance(sex, str):
-            sex_clean = sex.strip().lower()
-            if sex_clean in ("male", "m", "1", "1.0", "true"):
-                sex_val = 1.0
-            elif sex_clean in ("female", "f", "0", "0.0", "false"):
-                sex_val = 0.0
-            else:
-                raise ValueError(f"Unrecognized sex category '{sex}'. Supported: 'Male', 'Female', 1, 0.")
-        else:
-            sex_val = 1.0 if float(sex) > 0.5 else 0.0
+        sanitized, _ = check_clinical_vitals(
+            age=age,
+            sex=sex,
+            spo2=spo2,
+            smoking=smoking_history,
+            cough_severity=cough_severity,
+            fever=fever,
+        )
 
-        # Encode cough severity
-        if isinstance(cough_severity, str):
-            cough_clean = cough_severity.strip().lower()
-            cough_map = {
-                "none": 0.0,
-                "no": 0.0,
-                "normal": 0.0,
-                "mild": 1.0,
-                "moderate": 2.0,
-                "severe": 3.0,
-                "high": 3.0,
-            }
-            if cough_clean in cough_map:
-                cough_val = cough_map[cough_clean]
-            else:
-                try:
-                    cough_val = float(cough_clean)
-                except ValueError:
-                    raise ValueError(
-                        f"Unrecognized cough severity '{cough_severity}'. "
-                        "Supported: 'None', 'Mild', 'Moderate', 'Severe' or numeric 0-3."
-                    )
-        else:
-            cough_val = float(cough_severity)
-
-        # Parse smoking pack-years
-        if isinstance(smoking_history, str):
-            smk_clean = smoking_history.strip().lower()
-            if smk_clean in ("no", "never", "none"):
-                smoking_val = 0.0
-            else:
-                try:
-                    smoking_val = float(smk_clean)
-                except ValueError:
-                    raise ValueError(f"Invalid smoking exposure '{smoking_history}'. Expected nonnegative number.")
-        else:
-            smoking_val = float(smoking_history)
-
-        # Parse temperature / fever
-        fever_num = float(fever)
-        # If entered in Celsius (< 48°C), convert to Fahrenheit
-        if 25.0 <= fever_num <= 48.0:
-            temp_f = fever_num * (9.0 / 5.0) + 32.0
-        elif fever_num in (0.0, 1.0):
-            # Binary flag: 0 -> normal baseline (98.6°F), 1 -> elevated fever (101.5°F)
-            temp_f = 101.5 if fever_num == 1.0 else 98.6
-        else:
-            temp_f = fever_num
-
-        age_val = float(age)
-        spo2_val = float(spo2)
-
-        # Construct single-sample DataFrame with exact fitted feature column names
         cols = list(self.feature_names)
         df_row = pd.DataFrame(
-            [[age_val, sex_val, spo2_val, smoking_val, cough_val, temp_f]],
+            [[sanitized["age"], sanitized["sex"], sanitized["spo2"], sanitized["smoking_history"], sanitized["cough_severity"], sanitized["fever"]]],
             columns=cols,
         )
 
@@ -281,79 +488,30 @@ class DiagnosticPipeline:
         smoking: Any,
         cough_severity: Any,
         fever: Any,
-    ) -> None:
+    ) -> Tuple[Image.Image, Dict[str, float], List[str]]:
         """
-        Validate nulls, types, and domain range boundaries for all input modalities.
+        Validate nulls, types, domain boundaries, and image integrity for all modalities.
 
-        Raises:
-            ValueError: If any input is None, invalid, or out of clinical bounds.
+        Returns:
+            Tuple[Image.Image, Dict[str, float], List[str]]:
+                1. Sanitized RGB PIL Image.
+                2. Sanitized numeric clinical parameters dictionary.
+                3. List of atypical clinical alert messages.
         """
-        # 1. Image validation
-        if pil_image is None:
-            raise ValueError("Input image is required and cannot be None.")
-
-        # 2. Null check for clinical inputs
-        params = {
-            "age": age,
-            "sex": sex,
-            "spo2": spo2,
-            "smoking": smoking,
-            "cough_severity": cough_severity,
-            "fever": fever,
-        }
-        for name, val in params.items():
-            if val is None or (isinstance(val, str) and not val.strip()):
-                raise ValueError(f"Clinical input '{name}' cannot be None or empty.")
-
-        # 3. Numeric bounds validation
-        try:
-            age_f = float(age)
-            if not (0.0 <= age_f <= 125.0):
-                raise ValueError(f"Age must be between 0 and 125 years (got {age_f}).")
-        except (ValueError, TypeError) as e:
-            if "between 0 and 125" in str(e):
-                raise
-            raise ValueError(f"Invalid age value: '{age}'. Must be a valid number.")
-
-        try:
-            spo2_f = float(spo2)
-            # If percentage given in 0.0 - 1.0, allow or check 0 - 100
-            if spo2_f <= 1.0 and spo2_f > 0.0:
-                spo2_f *= 100.0
-            if not (40.0 <= spo2_f <= 100.0):
-                raise ValueError(f"SpO2 oxygen saturation must be between 40% and 100% (got {spo2_f}%).")
-        except (ValueError, TypeError) as e:
-            if "between 40%" in str(e):
-                raise
-            raise ValueError(f"Invalid SpO2 value: '{spo2}'. Must be a valid percentage.")
-
-        try:
-            if not isinstance(smoking, str) or smoking.strip().lower() not in ("no", "never", "none"):
-                smk_f = float(smoking)
-                if smk_f < 0.0:
-                    raise ValueError(f"Smoking pack-years cannot be negative (got {smk_f}).")
-        except (ValueError, TypeError) as e:
-            if "negative" in str(e):
-                raise
-            raise ValueError(f"Invalid smoking exposure value: '{smoking}'.")
-
-        try:
-            fever_f = float(fever)
-            # Valid temperatures: 25 - 48 °C or 80 - 118 °F, or binary 0/1
-            if fever_f in (0.0, 1.0):
-                pass
-            elif 25.0 <= fever_f <= 48.0 or 80.0 <= fever_f <= 118.0:
-                pass
-            else:
-                raise ValueError(f"Body temperature {fever_f} is outside plausible clinical range (80-118°F or 25-48°C).")
-        except (ValueError, TypeError) as e:
-            if "plausible clinical range" in str(e):
-                raise
-            raise ValueError(f"Invalid body temperature value: '{fever}'. Must be a valid number.")
+        clean_pil = sanitize_image(pil_image)
+        sanitized_vitals, warnings_list = check_clinical_vitals(
+            age=age,
+            sex=sex,
+            spo2=spo2,
+            smoking=smoking,
+            cough_severity=cough_severity,
+            fever=fever,
+        )
+        return clean_pil, sanitized_vitals, warnings_list
 
     def predict(
         self,
-        pil_image: Union[Image.Image, np.ndarray, str, Path],
+        pil_image: Any,
         age: Union[int, float],
         sex: Union[str, int, float],
         spo2: Union[int, float],
@@ -361,27 +519,29 @@ class DiagnosticPipeline:
         cough_severity: Union[int, float, str] = 0.0,
         fever: Union[int, float, bool] = 98.6,
         alpha: float = 0.4,
+        return_warnings: bool = False,
         **kwargs: Any,
-    ) -> Tuple[np.ndarray, Dict[str, float], str]:
+    ) -> Union[Tuple[np.ndarray, Dict[str, float], str], Tuple[np.ndarray, Dict[str, float], str, List[str]]]:
         """
-        Execute full multimodal diagnostic inference and Grad-CAM explanation.
+        Execute full multimodal diagnostic inference and Grad-CAM explanation with CUDA OOM recovery.
 
         Args:
-            pil_image: Input chest radiograph (PIL Image, RGB numpy array, or file path).
-            age: Patient age in years.
+            pil_image: Input chest radiograph (PIL Image, RGB/RGBA/Grayscale array, or file path).
+            age: Patient age in years ([1, 110]).
             sex: Sex category ("Male", "Female", 1, 0).
-            spo2: Blood oxygen saturation percentage (SpO2).
+            spo2: Blood oxygen saturation percentage (clamped to [50, 100]).
             smoking: Cumulative smoking pack-years (or smoking_history alias).
             cough_severity: Severity rating of cough symptoms (0-3 or 'Mild'/'Moderate'/'Severe').
-            fever: Body temperature (in °F, °C, or binary).
+            fever: Body temperature in [95.0, 107.0]°F (or °C auto-converted).
             alpha: Transparency weight for Grad-CAM overlay (default: 0.4).
+            return_warnings: If True, returns (overlay, probs, pred_name, warnings_list).
 
         Returns:
-            Tuple[np.ndarray, Dict[str, float], str]:
+            Tuple[np.ndarray, Dict[str, float], str] (or 4-tuple with warnings):
                 1. overlay_image: Blended RGB numpy array of shape (H, W, 3), dtype uint8.
                 2. probabilities_dict: Mapping class names to softmax probabilities.
-                   e.g. {'Normal': 0.85, 'Pneumonia': 0.10, 'High-Risk / COVID-19': 0.05}.
                 3. predicted_class_name: The highest probability diagnosis name.
+                (4. Optional warnings_list: List of atypical vitals alert messages).
 
         Raises:
             ValueError: If inputs fail validation checks.
@@ -389,8 +549,8 @@ class DiagnosticPipeline:
         # Support keyword alias 'smoking_history' if passed
         actual_smoking = kwargs.get("smoking_history", smoking)
 
-        # 1. Validate inputs
-        self.validate_inputs(
+        # 1. Comprehensive Input Validation & Sanitization
+        clean_pil, sanitized_vitals, warnings_list = self.validate_inputs(
             pil_image=pil_image,
             age=age,
             sex=sex,
@@ -399,30 +559,35 @@ class DiagnosticPipeline:
             cough_severity=cough_severity,
             fever=fever,
         )
-
-        # Keep original image for overlay
-        if isinstance(pil_image, (str, Path)):
-            orig_pil = Image.open(str(pil_image)).convert("RGB")
-        elif isinstance(pil_image, np.ndarray):
-            orig_pil = Image.fromarray(pil_image).convert("RGB")
-        else:
-            orig_pil = pil_image.convert("RGB")
+        self.last_warnings = warnings_list
 
         # 2. Transform Image and Clinical inputs
-        img_tensor = self.transform_image(orig_pil)
+        img_tensor = self.transform_image(clean_pil)
         clin_tensor = self.transform_tabular(
-            age=age,
-            sex=sex,
-            spo2=spo2,
-            smoking_history=actual_smoking,
-            cough_severity=cough_severity,
-            fever=fever,
+            age=sanitized_vitals["age"],
+            sex=sanitized_vitals["sex"],
+            spo2=sanitized_vitals["spo2"],
+            smoking_history=sanitized_vitals["smoking_history"],
+            cough_severity=sanitized_vitals["cough_severity"],
+            fever=sanitized_vitals["fever"],
         )
 
-        # 3. Model Forward Pass & Probability Computation
-        with torch.no_grad():
-            logits, _ = self.model(img_tensor, clin_tensor)
-            probs = F.softmax(logits, dim=1)[0]
+        # 3. Model Forward Pass & Probability Computation with CUDA OOM Fallback
+        try:
+            with torch.no_grad():
+                logits, _ = self.model(img_tensor, clin_tensor)
+                probs = F.softmax(logits, dim=1)[0]
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as err:
+            is_oom = "out of memory" in str(err).lower() or isinstance(err, getattr(torch.cuda, "OutOfMemoryError", ()))
+            if is_oom and self.device.type == "cuda":
+                self.fallback_to_cpu()
+                img_tensor = img_tensor.to("cpu")
+                clin_tensor = clin_tensor.to("cpu")
+                with torch.no_grad():
+                    logits, _ = self.model(img_tensor, clin_tensor)
+                    probs = F.softmax(logits, dim=1)[0]
+            else:
+                raise
 
         # 4. Extract Diagnostic Predictions
         pred_idx = int(torch.argmax(probs).item())
@@ -433,94 +598,106 @@ class DiagnosticPipeline:
             for i in range(len(TARGET_CLASSES))
         }
 
-        # 5. Compute Grad-CAM Saliency & Alpha Overlay
-        heatmap = self.gradcam.generate_heatmap(
-            img_tensor=img_tensor,
-            clin_tensor=clin_tensor,
-            target_class=pred_idx,
-        )
+        # 5. Compute Grad-CAM Saliency & Alpha Overlay with CUDA OOM Fallback
+        try:
+            heatmap = self.gradcam.generate_heatmap(
+                img_tensor=img_tensor,
+                clin_tensor=clin_tensor,
+                target_class=pred_idx,
+            )
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as err:
+            is_oom = "out of memory" in str(err).lower() or isinstance(err, getattr(torch.cuda, "OutOfMemoryError", ()))
+            if is_oom and self.device.type == "cuda":
+                self.fallback_to_cpu()
+                img_tensor = img_tensor.to("cpu")
+                clin_tensor = clin_tensor.to("cpu")
+                heatmap = self.gradcam.generate_heatmap(
+                    img_tensor=img_tensor,
+                    clin_tensor=clin_tensor,
+                    target_class=pred_idx,
+                )
+            else:
+                raise
 
         overlay_image = self.gradcam.overlay_heatmap(
             heatmap=heatmap,
-            original_pil_img=orig_pil,
+            original_pil_img=clean_pil,
             alpha=alpha,
             colormap=cv2.COLORMAP_JET,
         )
+
+        if return_warnings:
+            return overlay_image, probabilities_dict, predicted_class_name, warnings_list
 
         return overlay_image, probabilities_dict, predicted_class_name
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print(" RayXplain Phase 4: DiagnosticPipeline Verification Suite")
+    print(" RayXplain Phase 6: Hardened DiagnosticPipeline Verification")
     print("=" * 70)
 
     # 1. Instantiate Pipeline
-    print("\n[1/4] Instantiating DiagnosticPipeline...")
+    print("\n[1/5] Instantiating Pipeline...")
     pipeline = DiagnosticPipeline()
-    print(f"      Execution Device    : {pipeline.device}")
-    print(f"      Model Parameters    : {sum(p.numel() for p in pipeline.model.parameters()):,}")
-    print(f"      Scaler Features     : {list(pipeline.feature_names)}")
+    print(f"      Initial Device: {pipeline.device}")
 
-    # 2. Generate Synthetic Chest Radiograph & Clinical Data
-    print("\n[2/4] Generating synthetic patient inputs...")
-    synthetic_img = Image.new("RGB", (384, 384), color=(80, 85, 90))
-    test_age = 58
-    test_sex = "Male"
-    test_spo2 = 91.5
-    test_smoking = 15.0
-    test_cough = "Moderate"
-    test_fever = 101.8  # Elevated fever in °F
+    # 2. Test Image Robustness: Grayscale & RGBA
+    print("\n[2/5] Testing Image Robustness (Grayscale & 4-channel RGBA)...")
+    gray_arr = np.random.randint(50, 200, (300, 300), dtype=np.uint8)
+    rgba_arr = np.random.randint(50, 200, (300, 300, 4), dtype=np.uint8)
 
-    print(f"      Simulated Radiograph: {synthetic_img.size} (W, H)")
-    print(f"      Age: {test_age}, Sex: '{test_sex}', SpO2: {test_spo2}%, Smoking: {test_smoking} pk-yrs")
-    print(f"      Cough: '{test_cough}', Fever: {test_fever}°F")
+    t_gray = pipeline.transform_image(gray_arr)
+    t_rgba = pipeline.transform_image(rgba_arr)
+    assert t_gray.shape == (1, 3, 224, 224), "Failed grayscale transform"
+    assert t_rgba.shape == (1, 3, 224, 224), "Failed RGBA transform"
+    print("      [PASSED] Grayscale and RGBA standardized to 3-channel RGB [1, 3, 224, 224]")
 
-    # 3. Execute Pipeline Predict
-    print("\n[3/4] Running predict() end-to-end...")
-    overlay, probs, pred_name = pipeline.predict(
-        pil_image=synthetic_img,
-        age=test_age,
-        sex=test_sex,
-        spo2=test_spo2,
-        smoking=test_smoking,
-        cough_severity=test_cough,
-        fever=test_fever,
+    # 3. Test Tabular Clamping & Boundaries
+    print("\n[3/5] Testing Tabular Clamping & Clinical Sanity...")
+    # Test SpO2 clamping: 35% -> clamped to 50%
+    sanitized, warns = check_clinical_vitals(
+        age=50,
+        sex="Male",
+        spo2=35.0,
+        smoking=0,
+        cough_severity="None",
+        fever=98.6,
     )
+    assert sanitized["spo2"] == 50.0, f"Expected SpO2 clamped to 50.0, got {sanitized['spo2']}"
+    assert any("clamped" in w.lower() for w in warns), "Missing clamping warning"
+    print(f"      [PASSED] SpO2 35% clamped to {sanitized['spo2']}% with warning")
 
-    print(f"      Predicted Diagnosis : {pred_name}")
-    print(f"      Class Probabilities : {probs}")
-    print(f"      Overlay Image Shape : {overlay.shape}")
-    print(f"      Overlay Image Dtype : {overlay.dtype}")
-    print(f"      Overlay Pixel Range : [{overlay.min()}, {overlay.max()}]")
-
-    # 4. Strict Assertions
-    print("\n[4/4] Validating outputs & constraints...")
-    assert pred_name in TARGET_CLASSES, f"Unknown prediction: {pred_name}"
-    assert set(probs.keys()) == set(TARGET_CLASSES), "Mismatched probability keys"
-    assert abs(sum(probs.values()) - 1.0) < 1e-2, f"Probabilities don't sum to 1.0: {sum(probs.values())}"
-    assert overlay.shape == (384, 384, 3), f"Overlay shape mismatch: {overlay.shape}"
-    assert overlay.dtype == np.uint8, f"Expected uint8 overlay, got {overlay.dtype}"
-    assert overlay.min() >= 0 and overlay.max() <= 255, "Overlay pixel values outside [0, 255]"
-
-    # Test input validation errors
+    # 4. Test Error Boundaries: Age & Temperature
+    print("\n[4/5] Testing Strict Boundary Exceptions (Age & Temp)...")
     try:
-        pipeline.predict(pil_image=None, age=50, sex="Male", spo2=95, smoking=0, cough_severity=0, fever=98.6)
-        assert False, "Failed to catch None image"
+        check_clinical_vitals(age=120, sex="Male", spo2=95, smoking=0, cough_severity=0, fever=98.6)
+        assert False, "Failed to catch Age > 110"
     except ValueError:
-        pass
+        print("      [PASSED] Caught invalid Age > 110")
 
     try:
-        pipeline.predict(pil_image=synthetic_img, age=-5, sex="Male", spo2=95, smoking=0, cough_severity=0, fever=98.6)
-        assert False, "Failed to catch negative age"
+        check_clinical_vitals(age=50, sex="Male", spo2=95, smoking=0, cough_severity=0, fever=92.0)
+        assert False, "Failed to catch Temp < 95.0°F"
     except ValueError:
-        pass
+        print("      [PASSED] Caught invalid Temp < 95.0°F")
 
-    print("      [PASSED] Output shapes, dtypes, and probability constraints verified")
-    print("      [PASSED] Input range & null validation verified")
-    print("      [PASSED] Grad-CAM overlay dimensions perfectly match original radiograph")
+    # 5. Test CUDA Fallback
+    print("\n[5/5] Testing System Fallback to CPU...")
+    pipeline.fallback_to_cpu()
+    assert pipeline.device.type == "cpu", "Failed to switch device to CPU"
+    res_overlay, res_probs, res_pred = pipeline.predict(
+        pil_image=gray_arr,
+        age=45,
+        sex="Female",
+        spo2=96,
+        smoking=0,
+        cough_severity="None",
+        fever=98.6,
+    )
+    assert res_pred in TARGET_CLASSES
+    print("      [PASSED] CPU fallback executed successfully without crash")
 
     print("\n" + "=" * 70)
-    print(" DiagnosticPipeline Phase 4 Implementation VERIFIED SUCCESSFULLY!")
+    print(" Phase 6 Hardened Pipeline VERIFIED SUCCESSFULLY!")
     print("=" * 70)
-

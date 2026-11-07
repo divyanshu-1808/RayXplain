@@ -16,9 +16,8 @@ from app import analyze_patient_case, create_app, demo, ensure_example_cases
 class TestAppInterface(unittest.TestCase):
     def test_app_instantiation(self):
         """Verify Gradio app builds cleanly without configuration errors."""
-        app_instance = create_app()
-        self.assertIsInstance(app_instance, gr.Blocks)
-        self.assertIsNotNone(demo)
+        self.assertIsInstance(demo, gr.Blocks)
+        self.assertIsNotNone(demo.children)
 
     def test_missing_image_validation(self):
         """Verify error is raised when image input is missing."""

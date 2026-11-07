@@ -66,6 +66,10 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
+# Generated patient evaluations (preserve folder via .gitkeep)
+patient_records/TEST_*
+patient_records/*.csv
+
 # --- Jupyter Notebooks ---
 .ipynb_checkpoints/
 *-checkpoint.ipynb
