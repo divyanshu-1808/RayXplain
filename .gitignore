@@ -89,3 +89,6 @@ desktop.ini
 docs/*
 !docs/case_studies/
 
+# --- Personal Notes & Viva Defense ---
+VIVA_DEFENSE.md
+
