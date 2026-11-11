@@ -783,5 +783,5 @@ if __name__ == "__main__":
                 "sans-serif",
             ],
         )
-
+    launch_kwargs["share"] = True
     demo.launch(**launch_kwargs)
